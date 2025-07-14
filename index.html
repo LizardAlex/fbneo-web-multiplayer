@@ -218,8 +218,12 @@
       const romResp = await fetch('/rom');
       const romData = new Uint8Array(await romResp.arrayBuffer());
       await initEmulator();
-      // === Исправление: правильное имя ROM ===
-      const romName = 'tmnt'; // TODO: сделать динамическим, если нужно
+      // Получаем имя ROM с сервера
+      let romName = null;
+      if (!romName) {
+        const resp = await fetch('/romname');
+        romName = (await resp.text()).trim();
+      }
       fbneoModule.FS.mkdir('roms');
       fbneoModule.FS.writeFile(`roms/${romName}.zip`, romData);
       try {

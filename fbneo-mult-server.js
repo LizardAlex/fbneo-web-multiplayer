@@ -7,6 +7,7 @@ const WebSocket = require('ws');
 const app = express();
 const port = process.env.PORT || process.argv[2] || 5000;
 const romPath = process.argv[3];
+const romName = path.basename(romPath, '.zip');
 const maxPlayers = parseInt(process.argv[4], 10) || 2; // теперь задаётся аргументом, по умолчанию 2
 
 if (!romPath) {
@@ -26,6 +27,11 @@ app.get('/', async (req, res) => {
 // ROM отдача
 app.get('/rom', (req, res) => {
   res.sendFile(path.resolve(romPath));
+});
+
+// Endpoint для получения имени ROM
+app.get('/romname', (req, res) => {
+  res.send(romName);
 });
 
 // HTTP + WebSocket сервер
