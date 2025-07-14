@@ -127,8 +127,8 @@
         'ArrowRight': 1 << 1,
         'ArrowUp': 1 << 2,
         'ArrowDown': 1 << 3,
-        'z': 1 << 6,
-        'x': 1 << 7,
+        'KeyZ': 1 << 6,
+        'KeyX': 1 << 7,
         'Control': 1 << 4, // Start
         'Enter': 1 << 5,   // Coin
       },
@@ -137,8 +137,8 @@
         'ArrowRight': 1 << 1,
         'ArrowUp': 1 << 2,
         'ArrowDown': 1 << 3,
-        'z': 1 << 6,
-        'x': 1 << 7,
+        'KeyZ': 1 << 6,
+        'KeyX': 1 << 7,
         'Control': 1 << 4, // Start
         'Enter': 1 << 5,   // Coin
       },
@@ -147,8 +147,8 @@
         'ArrowRight': 1 << 1,
         'ArrowUp': 1 << 2,
         'ArrowDown': 1 << 3,
-        'z': 1 << 6,
-        'x': 1 << 7,
+        'KeyZ': 1 << 6,
+        'KeyX': 1 << 7,
         'Control': 1 << 4, // Start
         'Enter': 1 << 5,   // Coin
       },
@@ -157,8 +157,8 @@
         'ArrowRight': 1 << 1,
         'ArrowUp': 1 << 2,
         'ArrowDown': 1 << 3,
-        'z': 1 << 6,
-        'x': 1 << 7,
+        'KeyZ': 1 << 6,
+        'KeyX': 1 << 7,
         'Control': 1 << 4, // Start
         'Enter': 1 << 5,   // Coin
       },
@@ -513,7 +513,8 @@
     function handleKeyEvent(e, pressed) {
       if (playerNum < 1 || playerNum > 4) return;
       const map = keyMaps[playerNum - 1];
-      const btn = map[e.key] || map[e.code];
+      // Сначала ищем по e.code (работает всегда), потом по e.key (на всякий случай)
+      const btn = map[e.code] || map[e.key];
       if (btn !== undefined) {
         if (pressed) myControllerState |= btn;
         else myControllerState &= ~btn;
