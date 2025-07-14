@@ -1,15 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>FBNeo Multiplayer</title>
   <script src="https://unpkg.com/pako@2.1.0/dist/pako.min.js"></script>
-  <style>
+    <style>
     html, body {
       width: 100vw;
       height: 100vh;
-      margin: 0;
+            margin: 0;
       padding: 0;
       overflow: hidden;
       background: #000;
@@ -60,7 +60,7 @@
       background: #222;
       color: #fff;
       opacity: 0.9;
-      cursor: pointer;
+            cursor: pointer;
       pointer-events: auto;
     }
     #status-overlay {
@@ -87,27 +87,27 @@
       background: rgba(0,0,0,0.35);
       border-radius: 0 0 12px 0;
       transition: opacity 0.2s;
-    }
-  </style>
+        }
+    </style>
 </head>
 <body>
   <div class="canvas-container">
     <button id="fullscreen-btn">⛶</button>
     <div id="emulator">
-      <canvas id="canvas" width="800" height="600" tabindex="0"></canvas>
+        <canvas id="canvas" width="800" height="600" tabindex="0"></canvas>
     </div>
     <div id="status-overlay">Ожидание других игроков...</div>
   </div>
-  <script type="module">
-    import fbneo from './node_modules/@mantou/fbneo/em-out/fbneo-arcade.js';
+    <script type="module">
+        import fbneo from './node_modules/@mantou/fbneo/em-out/fbneo-arcade.js';
 
-    const canvas = document.getElementById('canvas');
+        const canvas = document.getElementById('canvas');
     const statusOverlay = document.getElementById('status-overlay');
     const fullscreenBtn = document.getElementById('fullscreen-btn');
-    let fbneoModule = null;
-    let gameRunning = false;
+        let fbneoModule = null;
+        let gameRunning = false;
     let width = 0, height = 0, vidBits = 32;
-    let currentFrame = new Uint8ClampedArray();
+        let currentFrame = new Uint8ClampedArray();
     let playerNum = 0;
     let ws = null;
     let remoteFrame = null;
@@ -117,8 +117,157 @@
     let lastSentState = 0;
     let isHost = false;
     let lastFrameTime = 0;
-    const targetFPS = 60;
-    const frameInterval = 1000 / targetFPS;
+
+    let audioCtx = null;
+    let gainNode = null;
+    let audioBufferQueue = [];
+    let sampleRate = 44100;
+
+    let audioSampleCount = 0;
+    let audioSampleLastPrint = performance.now();
+
+    let audioResampleBuffer = [];
+    let audioSendBuffer = [];
+    // --- Накопление аудиосэмплов для отправки ---
+    const AUDIO_CHUNK_SIZE = 1024;
+    const AUDIO_START_BUFFERS = 10;
+    const MAX_AUDIO_QUEUE = 40;
+
+    let currentInputSampleRate = 36750;
+
+    let sentToWorkletThisSecond = 0;
+    let lastSentSample = 0;
+
+    let frameCount = 0;
+    let lastFpsPrint = performance.now();
+
+    // Даунсемплинг с 44100 до 22050
+    function downsampleBuffer(input, fromRate, toRate) {
+      if (fromRate === toRate) return input;
+      const ratio = fromRate / toRate;
+      const outLen = Math.floor(input.length / ratio);
+      const out = new Int16Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        out[i] = input[Math.floor(i * ratio)];
+      }
+      return out;
+    }
+
+    function downsampleAndMono(stereoBuffer, inputSampleRate, outputSampleRate) {
+      if (outputSampleRate === inputSampleRate) return stereoBuffer;
+      const sampleRateRatio = inputSampleRate / outputSampleRate;
+      const outLength = Math.floor(stereoBuffer.length / 2 / sampleRateRatio);
+      const mono = new Int16Array(outLength);
+      for (let i = 0, j = 0; j < outLength; j++) {
+        const left = stereoBuffer[Math.floor(i)];
+        const right = stereoBuffer[Math.floor(i) + 1];
+        mono[j] = ((left + right) / 2) | 0;
+        i += 2 * sampleRateRatio;
+      }
+      return mono;
+    }
+
+    // Low-pass фильтр для сглаживания перед даунсемплингом
+    function lowPassFilter(buffer, windowSize = 5) {
+      const out = new Int16Array(buffer.length);
+      for (let i = 0; i < buffer.length; i++) {
+        let sum = 0, count = 0;
+        for (let j = -Math.floor(windowSize/2); j <= Math.floor(windowSize/2); j++) {
+          const idx = i + j;
+          if (idx >= 0 && idx < buffer.length) {
+            sum += buffer[idx];
+            count++;
+          }
+        }
+        out[i] = sum / count;
+      }
+      return out;
+    }
+
+    // Ресемплирование аудиобуфера, если sampleRate не совпадает
+    function resampleBuffer(input, fromRate, toRate) {
+      if (fromRate === toRate) return input;
+      const ratio = fromRate / toRate;
+      const outLen = Math.floor(input.length / ratio);
+      const out = new Int16Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        out[i] = input[Math.floor(i * ratio)];
+      }
+      return out;
+    }
+
+    // === Добавить функцию ресемплинга float32 → float32 ===
+    function resampleFloat32Buffer(input, fromRate, toRate) {
+      if (fromRate === toRate) return input;
+      const ratio = fromRate / toRate;
+      const outLen = Math.floor(input.length / ratio);
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const idx = i * ratio;
+        const idx0 = Math.floor(idx);
+        const idx1 = Math.min(idx0 + 1, input.length - 1);
+        const frac = idx - idx0;
+        out[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
+      }
+      return out;
+    }
+
+    // --- AudioWorklet интеграция ---
+    let workletNode = null;
+    let workletReady = false;
+    async function ensureAudioWorklet() {
+      await ensureAudioContext();
+      if (!workletReady) {
+        await audioCtx.audioWorklet.addModule('audio-worklet-processor.js');
+        workletNode = new AudioWorkletNode(audioCtx, 'pcm-player-processor');
+        workletNode.connect(gainNode || audioCtx.destination);
+        workletReady = true;
+      }
+    }
+
+    async function playNextBuffer() {
+      if (!audioBufferQueue.length || !audioCtx) return;
+      if (audioBufferQueue.length < AUDIO_START_BUFFERS) {
+        setTimeout(playNextBuffer, 10);
+        return;
+      }
+      let buf = audioBufferQueue.shift();
+      if (audioCtx.sampleRate !== 22050) {
+        buf = resampleBuffer(buf, 22050, audioCtx.sampleRate);
+      }
+      await ensureAudioWorklet();
+      // Преобразуем в Float32Array [-1, 1]
+      const floatBuf = new Float32Array(buf.length);
+      for (let i = 0; i < buf.length; i++) {
+        floatBuf[i] = buf[i] / 32768;
+      }
+      workletNode.port.postMessage(floatBuf);
+      // Продолжаем цикл, если есть ещё буферы
+      if (audioBufferQueue.length) setTimeout(playNextBuffer, 0);
+    }
+
+    // === AudioContext для хоста: sampleRate 44100 ===
+    function ensureAudioContext() {
+      if (!audioCtx) {
+        try {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
+        } catch (e) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        sampleRate = audioCtx.sampleRate;
+        console.log('AudioContext sampleRate:', audioCtx.sampleRate);
+        gainNode = audioCtx.createGain();
+        gainNode.gain.value = 0.3; // чуть тише
+        gainNode.connect(audioCtx.destination);
+      }
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+      // Ограничить очередь, чтобы не было большой задержки
+      if (audioBufferQueue.length > MAX_AUDIO_QUEUE) {
+        audioBufferQueue = audioBufferQueue.slice(-MAX_AUDIO_QUEUE);
+      }
+    }
 
     // Кнопки для 4 игроков (пример)
     const keyMaps = [
@@ -176,6 +325,22 @@
       }
     };
 
+    // Создаём или активируем AudioContext только после пользовательского действия
+    window.addEventListener('click', () => {
+      if (!audioCtx) {
+        ensureAudioContext();
+      } else if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    });
+    window.addEventListener('keydown', () => {
+      if (!audioCtx) {
+        ensureAudioContext();
+      } else if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+      }
+    });
+
     // --- WebSocket ---
     function connectWS() {
       ws = new WebSocket(`ws://${window.location.host}/ws`);
@@ -202,7 +367,16 @@
             }
           }
         } else if (event.data instanceof ArrayBuffer) {
-          // Получили кадр от host-а
+          const u8 = new Uint8Array(event.data);
+          // Проверяем префикс 'AUD0'
+          if (u8.length > 4 && u8[0] === 65 && u8[1] === 85 && u8[2] === 68 && u8[3] === 48) {
+            const int16 = new Int16Array(event.data, 4);
+            ensureAudioContext();
+            audioBufferQueue.push(int16);
+            if (audioBufferQueue.length === 1) playNextBuffer();
+            return;
+          }
+          // иначе — это видеокадр
           if (!isHost) {
             drawRemoteFrame(event.data);
           }
@@ -237,56 +411,64 @@
       requestAnimationFrame(gameLoopHost);
     }
 
-    async function initEmulator() {
+        async function initEmulator() {
       if (fbneoModule) return;
-      fbneoModule = await fbneo({
-        canvas: canvas,
+                fbneoModule = await fbneo({
+                    canvas: canvas,
         locateFile: (path) => `./node_modules/@mantou/fbneo/em-out/${path}`,
         setRomProps: (w, h, rotateGame, flipped, vidImageDepth) => {
           width = w; height = h; vidBits = vidImageDepth;
-        },
-        drawScreen: (vidImagePtr) => {
-          if (!isHost) return;
-          const pixelCount = width * height;
-          currentFrame = new Uint8ClampedArray(pixelCount * 4);
-          const b = new Uint8Array(fbneoModule.HEAP8.buffer, vidImagePtr, pixelCount * (vidBits === 16 ? 2 : 4));
-          let index = 0;
-          for (let i = 0; i < pixelCount; i++) {
-            if (vidBits === 16) {
-              const offset = i << 1;
-              const color = ((b[offset + 1] << 8) & 0xff00) | (b[offset] & 0xff);
-              currentFrame[index++] = ((color >> 11) & 0x1f) << 3;
-              currentFrame[index++] = ((color >> 5) & 0x3f) << 2;
-              currentFrame[index++] = (color & 0x1f) << 3;
-              currentFrame[index++] = 255;
-            } else {
-              const offset = i << 2;
-              currentFrame[index++] = b[offset + 2];
-              currentFrame[index++] = b[offset + 1];
-              currentFrame[index++] = b[offset];
-              currentFrame[index++] = 255;
+                    },
+                    drawScreen: (vidImagePtr) => {
+          if (isHost) {
+            frameCount++;
+            const now = performance.now();
+            if (now - lastFpsPrint > 1000) {
+              frameCount = 0;
+              lastFpsPrint = now;
             }
           }
-          // Отображаем кадр на canvas с масштабированием
-          const ctx = canvas.getContext('2d');
-          const imageData = new ImageData(currentFrame, width, height);
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
-          // Вычисляем масштаб для центрирования
-          const scaleX = canvas.width / width;
-          const scaleY = canvas.height / height;
-          const scale = Math.min(scaleX, scaleY);
-          const scaledWidth = width * scale;
-          const scaledHeight = height * scale;
-          const offsetX = (canvas.width - scaledWidth) / 2;
-          const offsetY = (canvas.height - scaledHeight) / 2;
-          // Создаем временный canvas для масштабирования
-          const tempCanvas = document.createElement('canvas');
-          tempCanvas.width = width;
-          tempCanvas.height = height;
-          const tempCtx = tempCanvas.getContext('2d');
-          tempCtx.putImageData(imageData, 0, 0);
-          ctx.drawImage(tempCanvas, offsetX, offsetY, scaledWidth, scaledHeight);
-        },
+          if (!isHost) return;
+                        const pixelCount = width * height;
+                        currentFrame = new Uint8ClampedArray(pixelCount * 4);
+          const b = new Uint8Array(fbneoModule.HEAP8.buffer, vidImagePtr, pixelCount * (vidBits === 16 ? 2 : 4));
+                            let index = 0;
+                            for (let i = 0; i < pixelCount; i++) {
+            if (vidBits === 16) {
+                                const offset = i << 1;
+                                const color = ((b[offset + 1] << 8) & 0xff00) | (b[offset] & 0xff);
+                                currentFrame[index++] = ((color >> 11) & 0x1f) << 3;
+                                currentFrame[index++] = ((color >> 5) & 0x3f) << 2;
+                                currentFrame[index++] = (color & 0x1f) << 3;
+                                currentFrame[index++] = 255;
+                        } else {
+                                const offset = i << 2;
+                                currentFrame[index++] = b[offset + 2];
+                                currentFrame[index++] = b[offset + 1];
+                                currentFrame[index++] = b[offset];
+                                currentFrame[index++] = 255;
+                            }
+                        }
+                        // Отображаем кадр на canvas с масштабированием
+                        const ctx = canvas.getContext('2d');
+                        const imageData = new ImageData(currentFrame, width, height);
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        // Вычисляем масштаб для центрирования
+                        const scaleX = canvas.width / width;
+                        const scaleY = canvas.height / height;
+                        const scale = Math.min(scaleX, scaleY);
+                        const scaledWidth = width * scale;
+                        const scaledHeight = height * scale;
+                        const offsetX = (canvas.width - scaledWidth) / 2;
+                        const offsetY = (canvas.height - scaledHeight) / 2;
+                        // Создаем временный canvas для масштабирования
+                        const tempCanvas = document.createElement('canvas');
+                        tempCanvas.width = width;
+                        tempCanvas.height = height;
+                        const tempCtx = tempCanvas.getContext('2d');
+                        tempCtx.putImageData(imageData, 0, 0);
+                        ctx.drawImage(tempCanvas, offsetX, offsetY, scaledWidth, scaledHeight);
+                    },
       });
       // === Исправление: addArchive для совместимости с wasm ===
       fbneoModule.addArchive = function(szName, szFullName, bFound) {
@@ -301,26 +483,75 @@
         return true;
       };
       // === Исправление: audioCallback для совместимости с wasm ===
-      fbneoModule.audioCallback = function(soundPtr, length) {
-        // Заглушка для звука (мультиплеер без звука)
+      fbneoModule.audioCallback = async function(soundPtr, length) {
+        const stereoSamples = new Int16Array(fbneoModule.HEAP16.buffer, soundPtr, length);
+        // Стерео → моно
+        const mono = new Int16Array(stereoSamples.length / 2);
+        for (let i = 0, j = 0; i < stereoSamples.length; i += 2, j++) {
+          mono[j] = ((stereoSamples[i] + stereoSamples[i + 1]) / 2) | 0;
+        }
+        audioSampleCount += mono.length;
+        const now = performance.now();
+
+        if (isHost) {
+          // Просто отправляем raw float32 (моно) в AudioWorklet
+          const floatBuf = new Float32Array(mono.length);
+          for (let i = 0; i < mono.length; i++) {
+            floatBuf[i] = mono[i] / 32768;
+          }
+          await ensureAudioWorklet();
+          workletNode.port.postMessage(floatBuf);
+        }
+
+        if (now - audioSampleLastPrint > 1000) {
+          currentInputSampleRate = audioSampleCount; // обновляем реальную частоту
+          audioSampleCount = 0;
+          audioSampleLastPrint = now;
+        }
+        ensureAudioContext();
+        // --- Для отправки клиентам: фильтрация + даунсемплинг до 22050 ---
+        const filtered = lowPassFilter(mono, 5);
+        const downsampled = downsampleBuffer(filtered, 44100, 22050);
+        if (!isHost) {
+          audioBufferQueue.push(downsampled.slice());
+          if (audioBufferQueue.length === 1) playNextBuffer();
+          if (audioBufferQueue.length > MAX_AUDIO_QUEUE) {
+            audioBufferQueue = audioBufferQueue.slice(-MAX_AUDIO_QUEUE);
+          }
+        }
+        // --- Отправка клиентам ---
+        audioSendBuffer.push(...downsampled);
+        while (audioSendBuffer.length >= AUDIO_CHUNK_SIZE) {
+          const chunk = audioSendBuffer.slice(0, AUDIO_CHUNK_SIZE);
+          audioSendBuffer = audioSendBuffer.slice(AUDIO_CHUNK_SIZE);
+          const prefix = new Uint8Array([65, 85, 68, 48]); // 'AUD0'
+          const audioBuf = new Uint8Array(prefix.length + chunk.length * 2);
+          audioBuf.set(prefix, 0);
+          audioBuf.set(new Uint8Array(new Int16Array(chunk).buffer), prefix.length);
+          if (ws && ws.readyState === 1) {
+            ws.send(audioBuf.buffer);
+          }
+        }
         return true;
       };
     }
 
+        const targetFPS = 76;
+        const frameInterval = 1000 / targetFPS;
     function gameLoopHost(currentTime) {
-      if (!gameRunning) return;
-
+            if (!gameRunning) return;
+            
       if (!lastFrameTime) lastFrameTime = currentTime;
       const delta = currentTime - lastFrameTime;
       if (delta < frameInterval) {
         requestAnimationFrame(gameLoopHost);
-        return;
-      }
-      lastFrameTime = currentTime;
-
+                return;
+            }
+            lastFrameTime = currentTime;
+            
       // Применяем кнопки всех игроков
       for (let i = 0; i < 4; i++) {
-        if (fbneoModule && fbneoModule._setEmInput) {
+                if (fbneoModule && fbneoModule._setEmInput) {
           fbneoModule._setEmInput(i, controllerStates[i] || 0, 0, 0, 0, 0);
         }
       }
@@ -567,6 +798,6 @@
     // --- Запуск ---
     connectWS();
     setStatus('Ожидание других игроков...');
-  </script>
+    </script>
 </body>
 </html> 
