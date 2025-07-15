@@ -130,7 +130,7 @@
     let audioSendBuffer = [];
     // --- Накопление аудиосэмплов для отправки ---
     const AUDIO_CHUNK_SIZE = 1024;
-    const AUDIO_START_BUFFERS = 10;
+    const AUDIO_START_BUFFERS = 1;
     const MAX_AUDIO_QUEUE = 40;
 
     let currentInputSampleRate = 36750;
@@ -212,38 +212,44 @@
       return out;
     }
 
-    // --- AudioWorklet интеграция ---
-    let workletNode = null;
-    let workletReady = false;
-    async function ensureAudioWorklet() {
-      await ensureAudioContext();
-      if (!workletReady) {
-        await audioCtx.audioWorklet.addModule('audio-worklet-processor.js');
-        workletNode = new AudioWorkletNode(audioCtx, 'pcm-player-processor');
-        workletNode.connect(gainNode || audioCtx.destination);
-        workletReady = true;
+    // --- ScriptProcessorNode интеграция ---
+    let scriptNode = null;
+    let scriptNodeBuffer = new Float32Array(0);
+    function ensureScriptProcessor() {
+      if (!scriptNode) {
+        scriptNode = audioCtx.createScriptProcessor(2048, 1, 1);
+        scriptNode.onaudioprocess = function(e) {
+          const output = e.outputBuffer.getChannelData(0);
+          let offset = 0;
+          while (offset < output.length) {
+            if (scriptNodeBuffer.length === 0 && audioBufferQueue.length) {
+              let buf = audioBufferQueue.shift();
+              // Для хоста: ресемплинг только если sampleRate не 44100
+              if (isHost && audioCtx.sampleRate !== 44100) {
+                buf = resampleBuffer(buf, 44100, audioCtx.sampleRate);
+              }
+              // Для клиента: ресемплинг если sampleRate не 22050
+              if (!isHost && audioCtx.sampleRate !== 22050) {
+                buf = resampleBuffer(buf, 22050, audioCtx.sampleRate);
+              }
+              scriptNodeBuffer = new Float32Array(buf.length);
+              for (let i = 0; i < buf.length; i++) {
+                scriptNodeBuffer[i] = buf[i] / 32768;
+              }
+            }
+            const toCopy = Math.min(output.length - offset, scriptNodeBuffer.length);
+            if (toCopy > 0) {
+              output.set(scriptNodeBuffer.subarray(0, toCopy), offset);
+              scriptNodeBuffer = scriptNodeBuffer.subarray(toCopy);
+              offset += toCopy;
+            } else {
+              output.fill(0, offset);
+              break;
+            }
+          }
+        };
+        scriptNode.connect(gainNode || audioCtx.destination);
       }
-    }
-
-    async function playNextBuffer() {
-      if (!audioBufferQueue.length || !audioCtx) return;
-      if (audioBufferQueue.length < AUDIO_START_BUFFERS) {
-        setTimeout(playNextBuffer, 10);
-        return;
-      }
-      let buf = audioBufferQueue.shift();
-      if (audioCtx.sampleRate !== 22050) {
-        buf = resampleBuffer(buf, 22050, audioCtx.sampleRate);
-      }
-      await ensureAudioWorklet();
-      // Преобразуем в Float32Array [-1, 1]
-      const floatBuf = new Float32Array(buf.length);
-      for (let i = 0; i < buf.length; i++) {
-        floatBuf[i] = buf[i] / 32768;
-      }
-      workletNode.port.postMessage(floatBuf);
-      // Продолжаем цикл, если есть ещё буферы
-      if (audioBufferQueue.length) setTimeout(playNextBuffer, 0);
     }
 
     // === AudioContext для хоста: sampleRate 44100 ===
@@ -266,6 +272,43 @@
       // Ограничить очередь, чтобы не было большой задержки
       if (audioBufferQueue.length > MAX_AUDIO_QUEUE) {
         audioBufferQueue = audioBufferQueue.slice(-MAX_AUDIO_QUEUE);
+      }
+    }
+
+    // === ScriptProcessorNode для хоста ===
+    const HOST_AUDIO_CHUNK_SIZE = 1024;
+    let hostAudioBufferQueue = [];
+    let hostScriptNode = null;
+    let hostScriptNodeBuffer = new Float32Array(0);
+    function ensureHostScriptProcessor() {
+      if (!hostScriptNode) {
+        hostScriptNode = audioCtx.createScriptProcessor(HOST_AUDIO_CHUNK_SIZE, 1, 1);
+        hostScriptNode.onaudioprocess = function(e) {
+          const output = e.outputBuffer.getChannelData(0);
+          let offset = 0;
+          while (offset < output.length) {
+            if (hostScriptNodeBuffer.length === 0 && hostAudioBufferQueue.length) {
+              let buf = hostAudioBufferQueue.shift();
+              if (audioCtx.sampleRate !== 44100) {
+                buf = resampleBuffer(buf, 44100, audioCtx.sampleRate);
+              }
+              hostScriptNodeBuffer = new Float32Array(buf.length);
+              for (let i = 0; i < buf.length; i++) {
+                hostScriptNodeBuffer[i] = buf[i] / 32768;
+              }
+            }
+            const toCopy = Math.min(output.length - offset, hostScriptNodeBuffer.length);
+            if (toCopy > 0) {
+              output.set(hostScriptNodeBuffer.subarray(0, toCopy), offset);
+              hostScriptNodeBuffer = hostScriptNodeBuffer.subarray(toCopy);
+              offset += toCopy;
+            } else {
+              output.fill(0, offset);
+              break;
+            }
+          }
+        };
+        hostScriptNode.connect(gainNode || audioCtx.destination);
       }
     }
 
@@ -372,8 +415,11 @@
           if (u8.length > 4 && u8[0] === 65 && u8[1] === 85 && u8[2] === 68 && u8[3] === 48) {
             const int16 = new Int16Array(event.data, 4);
             ensureAudioContext();
+            ensureScriptProcessor();
             audioBufferQueue.push(int16);
-            if (audioBufferQueue.length === 1) playNextBuffer();
+            if (audioBufferQueue.length > 1) {
+              audioBufferQueue = audioBufferQueue.slice(-1);
+            }
             return;
           }
           // иначе — это видеокадр
@@ -494,13 +540,13 @@
         const now = performance.now();
 
         if (isHost) {
-          // Просто отправляем raw float32 (моно) в AudioWorklet
-          const floatBuf = new Float32Array(mono.length);
-          for (let i = 0; i < mono.length; i++) {
-            floatBuf[i] = mono[i] / 32768;
+          ensureAudioContext();
+          ensureHostScriptProcessor();
+          hostAudioBufferQueue.push(mono.slice());
+          if (hostAudioBufferQueue.length > 3) {
+            hostAudioBufferQueue = hostAudioBufferQueue.slice(-3);
           }
-          await ensureAudioWorklet();
-          workletNode.port.postMessage(floatBuf);
+          // Удалён дублирующий AudioBufferSourceNode для хоста
         }
 
         if (now - audioSampleLastPrint > 1000) {
@@ -513,10 +559,11 @@
         const filtered = lowPassFilter(mono, 5);
         const downsampled = downsampleBuffer(filtered, 44100, 22050);
         if (!isHost) {
+          ensureAudioContext();
+          ensureScriptProcessor();
           audioBufferQueue.push(downsampled.slice());
-          if (audioBufferQueue.length === 1) playNextBuffer();
-          if (audioBufferQueue.length > MAX_AUDIO_QUEUE) {
-            audioBufferQueue = audioBufferQueue.slice(-MAX_AUDIO_QUEUE);
+          if (audioBufferQueue.length > 1) {
+            audioBufferQueue = audioBufferQueue.slice(-1);
           }
         }
         // --- Отправка клиентам ---
@@ -790,9 +837,44 @@
             }
           }
         } else if (event.data instanceof ArrayBuffer) {
-          // Не обрабатываем (host не получает кадры)
+          const u8 = new Uint8Array(event.data);
+          // Проверяем префикс 'AUD0'
+          if (u8.length > 4 && u8[0] === 65 && u8[1] === 85 && u8[2] === 68 && u8[3] === 48) {
+            const int16 = new Int16Array(event.data, 4);
+            ensureAudioContext();
+            ensureScriptProcessor();
+            audioBufferQueue.push(int16);
+            if (audioBufferQueue.length > 3) {
+              audioBufferQueue = audioBufferQueue.slice(-3);
+            }
+            return;
+          }
+          // иначе — это видеокадр
+          if (!isHost) {
+            drawRemoteFrame(event.data);
+          }
         }
       };
+    }
+
+    // --- Audio output fallback: AudioWorklet (если доступен) или ScriptProcessorNode ---
+    let useWorklet = false;
+    let workletNode = null;
+    async function ensureAudioOutputClient() {
+      await ensureAudioContext();
+      if (!useWorklet && audioCtx.audioWorklet) {
+        try {
+          await audioCtx.audioWorklet.addModule('audio-worklet-processor.js');
+          workletNode = new AudioWorkletNode(audioCtx, 'pcm-player-processor');
+          workletNode.connect(gainNode || audioCtx.destination);
+          useWorklet = true;
+        } catch (e) {
+          useWorklet = false;
+        }
+      }
+      if (!useWorklet) {
+        ensureScriptProcessor();
+      }
     }
 
     // --- Запуск ---
